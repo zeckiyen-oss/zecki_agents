@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v2)
+AGENT CREATEUR (v2.1)
 ===================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, puis remet la tâche à jour avec le statut
@@ -19,15 +19,24 @@ Toutes les clés viennent de variables d'environnement (Secrets GitHub).
 """
 
 import os
+import re
 import sys
 import time
+from urllib.parse import quote
+
 import requests
 
 # --- Configuration (lue depuis GitHub, jamais en dur) ---
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE = os.environ.get("AIRTABLE_TABLE") or "Produits"
+def _env(nom):
+    """Lit une variable en retirant espaces et retours à la ligne invisibles
+    (très fréquents après un copier-coller sur téléphone)."""
+    return (os.environ.get(nom) or "").strip()
+
+
+GROQ_API_KEY = _env("GROQ_API_KEY")
+AIRTABLE_TOKEN = _env("AIRTABLE_TOKEN")
+AIRTABLE_BASE_ID = _env("AIRTABLE_BASE_ID")
+AIRTABLE_TABLE = _env("AIRTABLE_TABLE") or "Produits"
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -168,12 +177,21 @@ def _erreur_airtable(e):
         type_err = err.get("type", "inconnu") if isinstance(err, dict) else str(err)
     except (ValueError, AttributeError):
         type_err = "inconnu"
-    return f"HTTP {r.status_code} ({type_err})"
+    indices = {
+        401: "token invalide ou expiré : vérifie AIRTABLE_TOKEN",
+        403: "le token n'a pas accès à cette base : Builder Hub > ton token > Access",
+        404: "base introuvable ou table introuvable : vérifie AIRTABLE_BASE_ID "
+             "(17 caractères, 'app...') et le nom exact de la table",
+        422: "champ ou option manquant dans Airtable (Titre, Type, Statut, Contenu)",
+    }
+    indice = indices.get(r.status_code)
+    suite = f" -> {indice}" if indice else ""
+    return f"HTTP {r.status_code} ({type_err}){suite}"
 
 
 def recuperer_prochaine_tache():
     """1er enregistrement avec Statut = 'à faire' (1 appel API)."""
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}"
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(AIRTABLE_TABLE, safe='')}"
     headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
     params = {"filterByFormula": "{Statut} = 'à faire'", "maxRecords": 1}
     r = requests.get(url, headers=headers, params=params, timeout=30)
@@ -184,7 +202,7 @@ def recuperer_prochaine_tache():
 
 def marquer_a_valider(record_id, contenu):
     """Ajoute le contenu et passe le statut à 'à valider' (1 appel API)."""
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}/{record_id}"
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(AIRTABLE_TABLE, safe='')}/{record_id}"
     headers = {
         "Authorization": f"Bearer {AIRTABLE_TOKEN}",
         "Content-Type": "application/json",
@@ -192,6 +210,20 @@ def marquer_a_valider(record_id, contenu):
     payload = {"fields": {"Contenu": contenu, "Statut": "à valider"}}
     r = requests.patch(url, headers=headers, json=payload, timeout=30)
     r.raise_for_status()
+
+
+def verifier_formats():
+    """Avertissements sur des formats suspects. N'affiche JAMAIS les valeurs."""
+    avis = []
+    if not re.fullmatch(r"app[A-Za-z0-9]{14}", AIRTABLE_BASE_ID):
+        avis.append(
+            f"AIRTABLE_BASE_ID semble incorrect (longueur {len(AIRTABLE_BASE_ID)}, "
+            "attendu 17 : 'app' + 14 caractères, sans espace ni '/')")
+    if not AIRTABLE_TOKEN.startswith("pat"):
+        avis.append("AIRTABLE_TOKEN ne commence pas par 'pat'")
+    if not GROQ_API_KEY.startswith("gsk_"):
+        avis.append("GROQ_API_KEY ne commence pas par 'gsk_'")
+    return avis
 
 
 def executer():
@@ -206,6 +238,10 @@ def executer():
         print(f"ERREUR : secret(s) manquant(s) -> {', '.join(manquants)}")
         print("Vérifie Settings > Secrets and variables > Actions sur GitHub.")
         sys.exit(1)
+
+    for avis in verifier_formats():
+        print(f"AVERTISSEMENT : {avis}")
+    print(f"Table utilisée : {AIRTABLE_TABLE}")
 
     print("Recherche d'une tâche 'à faire' dans Airtable...")
     try:
