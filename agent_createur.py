@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v3.2)
+AGENT CREATEUR (v3.3)
 =====================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, fabrique un PDF propre, puis remet la tâche à
@@ -39,7 +39,7 @@ from urllib.parse import quote
 
 import requests
 
-VERSION = "3.2"
+VERSION = "3.3"
 _DEBUT = time.monotonic()
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
@@ -115,18 +115,18 @@ BANNIERE_NOTION = ("> **Document de travail :** plan de construction du template
 SYSTEME_PACK = """Tu es rédacteur senior et expert en prompt engineering. Tu crées des packs de prompts vendus comme produit numérique à des Assistants Virtuels (VA) et Online Business Managers (OBM) freelances francophones. Le lecteur a payé : chaque prompt doit être précis, immédiatement utilisable et nettement meilleur que ce qu'il écrirait lui-même en 30 secondes.
 
 RÈGLES ABSOLUES
-1. Français professionnel et sans faute. Aucun emoji, aucun tableau, aucun HTML.
+1. Français professionnel et sans faute. Aucun emoji (même pour conseiller d'en utiliser), aucun tableau dans ta réponse, aucun HTML.
 2. Aucune introduction, aucune conclusion, aucun commentaire sur ta réponse : uniquement le contenu demandé.
 3. Chaque prompt est écrit pour être collé tel quel dans ChatGPT, Claude, Gemini ou Le Chat. Il suit le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE (ces mots exacts, en majuscules, suivis de « : »), tutoie l'IA (« Tu es... ») et commence la ligne TÂCHE par un verbe à l'impératif (« Rédige », « Crée », « Propose », jamais à l'infinitif). Il demande à l'IA de poser au plus 3 questions si une information essentielle manque.
 4. Les variables à remplacer s'écrivent en MAJUSCULES entre crochets, par exemple [NOM DU CLIENT]. Chaque prompt contient de 3 à 6 variables. N'utilise jamais les crochets pour autre chose.
-5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...).
+5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...) et n'attribue à un outil que des fonctions qu'il possède réellement (Calendly = prise de rendez-vous ; Notion et Trello = suivi de tâches ; Zoom = visioconférence) ; en cas de doute, reste générique (« votre agenda »).
 6. Sécurité : ne demande jamais de saisir un mot de passe, un code d'accès, un IBAN ou une donnée personnelle sensible dans un prompt. Pour partager des accès, recommande un gestionnaire de mots de passe.
 7. Si un prompt touche au juridique, à la fiscalité ou à la comptabilité, précise dans « Astuce » que le résultat doit être validé par un professionnel.
 8. Les 5 prompts d'une partie sont tous différents : varie les livrables (message, document, checklist, plan, script, analyse).
 9. Les lignes « Quand l'utiliser », « Résultat attendu » et « Astuce » s'adressent au lecteur : vouvoie-le (« Vérifiez... », « Ajoutez... »). Seuls les prompts tutoient l'IA.
 10. Le lecteur travaille seul(e) : n'écris ni « l'agence » ni « l'équipe » ; utilise [MON NOM] ou [MA MARQUE] quand il faut le désigner.
-11. Ne demande jamais à l'IA d'inventer un témoignage, un avis client, une statistique, une référence ou une citation : elle n'utilise que les informations fournies dans les variables.
-12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes)."""
+11. Ne demande jamais à l'IA d'inventer un témoignage, un avis client, une statistique, une référence ou une citation : elle n'utilise que les informations fournies dans les variables. N'écris jamais de lien ni d'adresse fictifs : utilise une variable comme [LIEN DU FORMULAIRE].
+12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes). Quand le prompt fixe un maximum, « Résultat attendu » écrit « jusqu'à N » ou « N au maximum », jamais « N » seul."""
 
 UTILISATEUR_PACK = """Thème du pack : « {titre} ».
 
@@ -371,7 +371,7 @@ def appeler_groq(modele, systeme, prompt, max_tokens):
 # ======================================================================
 # NETTOYAGE ET CONTRÔLE QUALITÉ DU TEXTE GÉNÉRÉ
 # ======================================================================
-_RE_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]")
+_RE_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2300-\u23FF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]")
 _ZERO_LARGEUR = dict.fromkeys(map(ord, "\u200b\u200c\ufeff\u2060"), None)
 _RE_H4 = re.compile(r"(?m)^#{4,6}\s+(.*?)\s*$")
 _RE_APOSTROPHE = re.compile(r"(?<=[A-Za-zÀ-ÿ])'(?=[A-Za-zÀ-ÿ])")
@@ -379,6 +379,20 @@ _RE_SEP_TABLEAU = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$
 _RE_VARIABLE = re.compile(r"\[[^\[\]\n]{2,80}\]")
 _MOTS_EN = re.compile(r"\b(the|and|you|your|with|for|this|that|are|will|please)\b", re.I)
 _MOTS_FR = re.compile(r"\b(le|la|les|des|et|pour|vous|de|du|un|une|est|sur|dans|que|qui|je|tu)\b", re.I)
+
+
+def _retirer_emoji(texte):
+    """Retire les emoji, puis répare la ponctuation qu'ils laissent : « (✅, ⏳, ❌) » ne doit pas devenir « (, , ) »."""
+    t = _RE_EMOJI.sub("", texte)
+    if t == texte:
+        return t
+    t = re.sub(r"\(\s*(?:[,;]\s*)+", "(", t)
+    t = re.sub(r"(?:\s*[,;])+\s*\)", ")", t)
+    t = re.sub(r"(?<=\S)\s*,(?:\s*,)+", ",", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    t = re.sub(r"\([ \t]+", "(", t)
+    t = re.sub(r"[ \t]+([,.)])", r"\1", t)
+    return re.sub(r"(?<=\S)[ \t]{2,}", " ", t)
 
 
 def _cellules(ligne):
@@ -441,7 +455,7 @@ def nettoyer_markdown(texte):
     t = t.replace("\\n", "\n")
     t = t.translate(_ZERO_LARGEUR)
     t = t.replace("\u2011", "-").replace("\u202f", "\u00a0")
-    t = _RE_EMOJI.sub("", t)
+    t = _retirer_emoji(t)
     t = _RE_APOSTROPHE.sub("\u2019", t)          # apostrophe typographique : l'IA -> l’IA
     t = "\n".join(l.rstrip() for l in t.split("\n"))
     t = tableaux_vers_listes(t)
@@ -488,6 +502,10 @@ def _champ(lignes, cle):
             morceaux.append(suite.strip())
         return " ".join(x for x in morceaux if x).strip().strip("*").strip()
     return ""
+
+
+def _majuscule(texte):
+    return texte[:1].upper() + texte[1:] if texte else texte
 
 
 def _normaliser_variables(code):
@@ -605,7 +623,7 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
         if _semble_anglais(code):
             raise ErreurModele(f"le prompt n°{k} est rédigé en anglais (le français est demandé)")
         hors_code = bloc["lignes"][:fences[0]] + bloc["lignes"][fences[1] + 1:]
-        quand, resultat, astuce = (_champ(hors_code, c) for c in ("quand", "resultat", "astuce"))
+        quand, resultat, astuce = (_majuscule(_champ(hors_code, c)) for c in ("quand", "resultat", "astuce"))
         prompts.append({"titre": titre, "quand": quand, "prompt": code,
                         "resultat": resultat, "astuce": astuce})
         stats.append((mots, variables, champs))
