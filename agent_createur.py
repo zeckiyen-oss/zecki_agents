@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v3.1)
+AGENT CREATEUR (v3.2)
 =====================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, fabrique un PDF propre, puis remet la tâche à
@@ -29,6 +29,7 @@ Fichiers du dépôt : agent_createur.py, mise_en_page.py, requirements.txt.
 """
 
 import base64
+import difflib
 import os
 import re
 import sys
@@ -38,7 +39,7 @@ from urllib.parse import quote
 
 import requests
 
-VERSION = "3.1"
+VERSION = "3.2"
 _DEBUT = time.monotonic()
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
@@ -116,12 +117,16 @@ SYSTEME_PACK = """Tu es rédacteur senior et expert en prompt engineering. Tu cr
 RÈGLES ABSOLUES
 1. Français professionnel et sans faute. Aucun emoji, aucun tableau, aucun HTML.
 2. Aucune introduction, aucune conclusion, aucun commentaire sur ta réponse : uniquement le contenu demandé.
-3. Chaque prompt est écrit pour être collé tel quel dans ChatGPT, Claude, Gemini ou Le Chat. Il suit le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE, tutoie l'IA (« Tu es... », « Rédige... ») et lui demande de poser au plus 3 questions si une information essentielle manque.
+3. Chaque prompt est écrit pour être collé tel quel dans ChatGPT, Claude, Gemini ou Le Chat. Il suit le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE (ces mots exacts, en majuscules, suivis de « : »), tutoie l'IA (« Tu es... ») et commence la ligne TÂCHE par un verbe à l'impératif (« Rédige », « Crée », « Propose », jamais à l'infinitif). Il demande à l'IA de poser au plus 3 questions si une information essentielle manque.
 4. Les variables à remplacer s'écrivent en MAJUSCULES entre crochets, par exemple [NOM DU CLIENT]. Chaque prompt contient de 3 à 6 variables. N'utilise jamais les crochets pour autre chose.
 5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...).
 6. Sécurité : ne demande jamais de saisir un mot de passe, un code d'accès, un IBAN ou une donnée personnelle sensible dans un prompt. Pour partager des accès, recommande un gestionnaire de mots de passe.
 7. Si un prompt touche au juridique, à la fiscalité ou à la comptabilité, précise dans « Astuce » que le résultat doit être validé par un professionnel.
-8. Les 5 prompts d'une partie sont tous différents : varie les livrables (message, document, checklist, plan, script, analyse)."""
+8. Les 5 prompts d'une partie sont tous différents : varie les livrables (message, document, checklist, plan, script, analyse).
+9. Les lignes « Quand l'utiliser », « Résultat attendu » et « Astuce » s'adressent au lecteur : vouvoie-le (« Vérifiez... », « Ajoutez... »). Seuls les prompts tutoient l'IA.
+10. Le lecteur travaille seul(e) : n'écris ni « l'agence » ni « l'équipe » ; utilise [MON NOM] ou [MA MARQUE] quand il faut le désigner.
+11. Ne demande jamais à l'IA d'inventer un témoignage, un avis client, une statistique, une référence ou une citation : elle n'utilise que les informations fournies dans les variables.
+12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes)."""
 
 UTILISATEUR_PACK = """Thème du pack : « {titre} ».
 
@@ -147,7 +152,7 @@ FORMAT DE SORTIE : ...
 **Résultat attendu :** une à deux phrases qui décrivent ce que l'IA va produire (structure, longueur).
 **Astuce :** une phrase (variante utile ou erreur à éviter).
 
-Chaque prompt (le texte entre les deux lignes ```) fait entre 90 et 170 mots. Écris la catégorie puis les 5 prompts, rien d'autre."""
+Chaque prompt (le texte entre les deux lignes ```) fait entre 120 et 180 mots : le CONTEXTE demande au moins 3 informations au lecteur (sous forme de variables) et les CONTRAINTES donnent 3 à 5 précisions concrètes (longueur, ton, ce qu'il faut éviter, structure). Écris la catégorie puis les 5 prompts, rien d'autre."""
 
 AXES_PACK = [
     ("Avant : préparer et cadrer",
@@ -492,6 +497,46 @@ def _normaliser_variables(code):
     return _RE_ANGLES.sub(lambda m: "[" + m.group(1).strip() + "]", code)
 
 
+_ETIQUETTES_PROMPT = {
+    "ROLE": "RÔLE", "CONTEXTE": "CONTEXTE", "TACHE": "TÂCHE", "CONTRAINTES": "CONTRAINTES",
+    "CONTRAINTE": "CONTRAINTES", "FORMAT DE SORTIE": "FORMAT DE SORTIE", "FORMAT": "FORMAT DE SORTIE",
+}
+_RE_LIGNE_ETIQUETTE = re.compile(r"^(\s*)([A-Za-zÀ-ÿ' ]{3,20}?)\s*:\s*(.*)$")
+CLAUSE_QUESTIONS = "Si une information essentielle manque, pose-moi jusqu\u2019à 3 questions avant de répondre."
+
+
+def _corriger_etiquettes(code):
+    """Remet en forme RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE, même quand le modèle
+    fait une faute (« CONTEXSE ») ou oublie un accent (« TACHE »). Les autres lignes ne sont pas touchées."""
+    sortie = []
+    for ligne in code.split("\n"):
+        m = _RE_LIGNE_ETIQUETTE.match(ligne)
+        if m:
+            brut = _sans_accents(m.group(2)).upper().strip()
+            cle = brut if brut in _ETIQUETTES_PROMPT else None
+            if cle is None:
+                proches = difflib.get_close_matches(brut, list(_ETIQUETTES_PROMPT), n=1, cutoff=0.8)
+                cle = proches[0] if proches else None
+            if cle:
+                ligne = f"{m.group(1)}{_ETIQUETTES_PROMPT[cle]} : {m.group(3)}"
+        sortie.append(ligne)
+    return "\n".join(sortie)
+
+
+def _ajouter_clause_questions(code):
+    """Garantit que chaque prompt demande à l'IA de poser des questions si une information manque
+    (les modèles l'oublient souvent) : la phrase est ajoutée à la ligne CONTRAINTES."""
+    if re.search(r"\b(?:pose|demande)[- ]moi\b", code, re.I):      # « pose-moi ... », « demande-moi ... »
+        return code
+    lignes = code.split("\n")
+    for k in range(len(lignes) - 1, -1, -1):
+        if re.match(r"^\s*CONTRAINTES\s*:", lignes[k]):
+            fin = lignes[k].rstrip()
+            lignes[k] = fin + ("" if fin.endswith((".", "!", "?", "\u00bb", ")")) else ".") + " " + CLAUSE_QUESTIONS
+            return "\n".join(lignes)
+    return code.rstrip() + "\n" + CLAUSE_QUESTIONS
+
+
 def _mesurer_prompt(code):
     """(nombre de mots, nombre de variables [..], nombre d'étiquettes RÔLE/CONTEXTE/TÂCHE...)"""
     sans_accent = _sans_accents(code).upper()
@@ -551,11 +596,12 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
             raise ErreurModele(f"le prompt n°{k} n'est pas placé dans un bloc de code (``` ... ```)")
         code = "\n".join(bloc["lignes"][fences[0] + 1:fences[1]]).strip("\n")
         code = _normaliser_variables(code).replace("**", "")
+        code = _ajouter_clause_questions(_corriger_etiquettes(code))
         mots, variables, champs = _mesurer_prompt(code)
         if mots < 40:
-            raise ErreurModele(f"le prompt n°{k} est trop court ({mots} mots ; 90 à 170 attendus)")
+            raise ErreurModele(f"le prompt n°{k} est trop court ({mots} mots ; 120 à 180 attendus)")
         if mots > 600:
-            raise ErreurModele(f"le prompt n°{k} est trop long ({mots} mots ; 90 à 170 attendus)")
+            raise ErreurModele(f"le prompt n°{k} est trop long ({mots} mots ; 120 à 180 attendus)")
         if _semble_anglais(code):
             raise ErreurModele(f"le prompt n°{k} est rédigé en anglais (le français est demandé)")
         hors_code = bloc["lignes"][:fences[0]] + bloc["lignes"][fences[1] + 1:]
@@ -575,7 +621,7 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
         avert.append(f"{manquantes} ligne(s) manquante(s) parmi « Quand l'utiliser », « Résultat attendu » et « Astuce »")
     courts = sum(1 for m, _, _ in stats if m < 60)
     if courts:
-        avert.append(f"{courts} prompt(s) de moins de 60 mots (90 à 170 attendus)")
+        avert.append(f"{courts} prompt(s) de moins de 60 mots (120 à 180 attendus)")
     return (categorie, prompts), avert
 
 
