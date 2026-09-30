@@ -37,6 +37,7 @@ from urllib.parse import quote
 
 import requests
 
+VERSION = "3.0"
 _DEBUT = time.monotonic()
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
@@ -74,6 +75,7 @@ TAILLE_MAX_PDF_OCTETS = 4_500_000   # Airtable accepte 5 Mo par envoi
 
 NB_PARTIES_PACK = 3
 NB_PROMPTS_PAR_PARTIE = 5
+ESSAIS_PAR_MODELE = 2         # 2e essai sur le même modèle seulement si le FORMAT a été refusé
 
 
 # ======================================================================
@@ -113,7 +115,7 @@ SYSTEME_PACK = """Tu es rédacteur senior et expert en prompt engineering. Tu cr
 RÈGLES ABSOLUES
 1. Français professionnel et sans faute. Aucun emoji, aucun tableau, aucun HTML.
 2. Aucune introduction, aucune conclusion, aucun commentaire sur ta réponse : uniquement le contenu demandé.
-3. Chaque prompt est écrit pour être collé tel quel dans ChatGPT, Claude, Gemini ou Le Chat. Il suit le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE, et demande à l'IA de poser au plus 3 questions si une information essentielle manque.
+3. Chaque prompt est écrit pour être collé tel quel dans ChatGPT, Claude, Gemini ou Le Chat. Il suit le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE, tutoie l'IA (« Tu es... », « Rédige... ») et lui demande de poser au plus 3 questions si une information essentielle manque.
 4. Les variables à remplacer s'écrivent en MAJUSCULES entre crochets, par exemple [NOM DU CLIENT]. Chaque prompt contient de 3 à 6 variables. N'utilise jamais les crochets pour autre chose.
 5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...).
 6. Sécurité : ne demande jamais de saisir un mot de passe, un code d'accès, un IBAN ou une donnée personnelle sensible dans un prompt. Pour partager des accès, recommande un gestionnaire de mots de passe.
@@ -417,9 +419,19 @@ def tableaux_vers_listes(markdown):
     return "\n".join(sortie)
 
 
+def _retirer_enveloppe_code(texte):
+    """Certains modèles enveloppent toute leur réponse dans un bloc ```markdown ... ```."""
+    lignes = texte.strip().split("\n")
+    if (len(lignes) > 2 and lignes[-1].strip() == "```"
+            and re.match(r"^```\s*(markdown|md|text)?\s*$", lignes[0].strip(), re.I)):
+        return "\n".join(lignes[1:-1])
+    return texte
+
+
 def nettoyer_markdown(texte):
     """Rend le texte propre et prévisible : sans emoji, sans tableau, sans \\n littéraux."""
     t = texte.replace("\r\n", "\n").replace("\r", "\n")
+    t = _retirer_enveloppe_code(t)
     t = t.replace("\\n", "\n")
     t = t.translate(_ZERO_LARGEUR)
     t = t.replace("\u2011", "-").replace("\u202f", "\u00a0")
@@ -609,13 +621,19 @@ class _Moteur:
     def generer(self, systeme, prompt, max_tokens, analyseur, etiquette):
         while self.rang < len(self.modeles):
             modele = self.modeles[self.rang]
-            print(f"  {etiquette} - modèle : {modele}")
-            try:
-                texte = appeler_groq(modele, systeme, prompt, max_tokens)
-                return analyseur(texte)
-            except ErreurModele as e:
-                print(f"  -> {modele} n'a pas pu répondre : {e}")
-                self.rang += 1
+            for essai in range(1, ESSAIS_PAR_MODELE + 1):
+                suffixe = f" (essai {essai})" if essai > 1 else ""
+                print(f"  {etiquette} - modèle : {modele}{suffixe}")
+                try:
+                    texte = appeler_groq(modele, systeme, prompt, max_tokens)
+                except ErreurModele as e:
+                    print(f"  -> {modele} n'a pas pu répondre : {e}")
+                    break                    # quota ou panne : inutile de réessayer ce modèle
+                try:
+                    return analyseur(texte)
+                except ErreurModele as e:
+                    print(f"  -> réponse de {modele} refusée : {e}")
+            self.rang += 1
         raise ErreurGeneration(f"aucun modèle n'a pu produire ({etiquette})")
 
 
@@ -651,6 +669,17 @@ def _nom_fichier_pdf(titre):
     ascii_ = unicodedata.normalize("NFKD", titre).encode("ascii", "ignore").decode("ascii").lower()
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_).strip("-")[:60].strip("-")
     return (slug or "produit") + ".pdf"
+
+
+def _etat_pdf():
+    """Dit si le module PDF est utilisable, sans rien afficher d'autre."""
+    try:
+        import mise_en_page
+        import reportlab
+        return f"prêt (reportlab {reportlab.Version})"
+    except Exception as e:
+        return (f"indisponible ({type(e).__name__}) : vérifie que mise_en_page.py est dans le dépôt "
+                "et que requirements.txt contient reportlab")
 
 
 def fabriquer_pdf(type_produit, titre, markdown, nb_prompts=None):
@@ -774,6 +803,7 @@ def verifier_formats():
 # EXÉCUTION
 # ======================================================================
 def executer():
+    print(f"Agent Créateur v{VERSION} | PDF : {_etat_pdf()}")
     manquants = [
         nom for nom, val in [
             ("GROQ_API_KEY", GROQ_API_KEY),
