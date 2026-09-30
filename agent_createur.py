@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v3.0)
+AGENT CREATEUR (v3.1)
 =====================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, fabrique un PDF propre, puis remet la tâche à
@@ -9,8 +9,9 @@ jour avec le statut "à valider". Toi seul valides ou refuses ensuite.
 NOUVEAUTÉS v3.0
 - Prompts réécrits : français, structure imposée, sans tableau ni emoji.
 - Pack de prompts généré en 3 appels (5 prompts chacun) : plus de profondeur.
-- Contrôle qualité automatique : un contenu qui ne respecte pas le format
-  n'est JAMAIS écrit dans Airtable (la tâche reste "à faire").
+- Contrôle qualité à deux niveaux : une structure inutilisable est refusée (rien
+  n'est écrit dans Airtable, la tâche reste "à faire") ; un défaut mineur
+  déclenche un 2e essai avec consignes précises, puis la meilleure version est gardée.
 - PDF (couverture, sommaire, cartes de prompts) joint au champ Airtable "PDF".
 
 CE QUE CET AGENT NE FAIT JAMAIS (sécurité) :
@@ -37,7 +38,7 @@ from urllib.parse import quote
 
 import requests
 
-VERSION = "3.0"
+VERSION = "3.1"
 _DEBUT = time.monotonic()
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
@@ -75,7 +76,7 @@ TAILLE_MAX_PDF_OCTETS = 4_500_000   # Airtable accepte 5 Mo par envoi
 
 NB_PARTIES_PACK = 3
 NB_PROMPTS_PAR_PARTIE = 5
-ESSAIS_PAR_MODELE = 2         # 2e essai sur le même modèle seulement si le FORMAT a été refusé
+ESSAIS_PAR_MODELE = 2         # 2e essai (avec consignes précises) si le contenu est refusé ou imparfait
 
 
 # ======================================================================
@@ -244,9 +245,9 @@ TYPES_PRODUITS = ("notion_template", "prompt_pack", "cv_template")
 # Contrôle qualité minimal des documents en un seul appel
 EXIGENCES_DOCUMENT = {
     "cv_template": {"systeme": SYSTEME_CV, "utilisateur": UTILISATEUR_CV,
-                    "sections": 6, "caracteres": 4000, "banniere": BANNIERE_CV},
+                    "sections": 6, "caracteres": 4000, "minimum": 1500, "banniere": BANNIERE_CV},
     "notion_template": {"systeme": SYSTEME_NOTION, "utilisateur": UTILISATEUR_NOTION,
-                        "sections": 6, "caracteres": 4000, "banniere": BANNIERE_NOTION},
+                        "sections": 6, "caracteres": 4000, "minimum": 1500, "banniere": BANNIERE_NOTION},
 }
 
 # Présentation du PDF selon le type de produit
@@ -370,7 +371,7 @@ _ZERO_LARGEUR = dict.fromkeys(map(ord, "\u200b\u200c\ufeff\u2060"), None)
 _RE_H4 = re.compile(r"(?m)^#{4,6}\s+(.*?)\s*$")
 _RE_APOSTROPHE = re.compile(r"(?<=[A-Za-zÀ-ÿ])'(?=[A-Za-zÀ-ÿ])")
 _RE_SEP_TABLEAU = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
-_RE_VARIABLE = re.compile(r"\[[^\[\]\n]{2,60}\]")
+_RE_VARIABLE = re.compile(r"\[[^\[\]\n]{2,80}\]")
 _MOTS_EN = re.compile(r"\b(the|and|you|your|with|for|this|that|are|will|please)\b", re.I)
 _MOTS_FR = re.compile(r"\b(le|la|les|des|et|pour|vous|de|du|un|une|est|sur|dans|que|qui|je|tu)\b", re.I)
 
@@ -453,12 +454,18 @@ def _semble_anglais(texte):
 
 
 # --- Pack de prompts : lecture d'une partie (1 catégorie + 5 prompts) ---
+# Deux niveaux : ErreurModele = structure inutilisable (on réessaie, puis on change de modèle) ;
+# avertissement = contenu utilisable mais imparfait (2e essai avec consignes précises, puis on
+# garde la meilleure version : tu relis de toute façon avant de valider).
 _ETIQUETTES = {
     "quand": re.compile(r"^\s*(?:[-*]\s+)?\**\s*quand\s+l['’]utiliser\s*\**\s*:?\s*\**\s*(.*)$", re.I),
     "resultat": re.compile(r"^\s*(?:[-*]\s+)?\**\s*r[ée]sultat\s+attendu\s*\**\s*:?\s*\**\s*(.*)$", re.I),
     "astuce": re.compile(r"^\s*(?:[-*]\s+)?\**\s*astuce\s*\**\s*:?\s*\**\s*(.*)$", re.I),
 }
-_CHAMPS_PROMPT = ("ROLE", "CONTEXTE", "TACHE", "CONTRAINTES", "FORMAT")
+_CHAMPS_PROMPT = (r"ROLE", r"CONTEXTE", r"TACHE", r"CONTRAINTES?", r"FORMAT(?:\s+DE\s+SORTIE)?")
+_RE_ACCOLADES2 = re.compile(r"\{\{\s*([^{}\n]{2,70}?)\s*\}\}")
+_RE_ACCOLADES1 = re.compile(r"\{\s*([A-ZÀ-ÖØ-Ý][^{}\n]{1,68}?)\s*\}")
+_RE_ANGLES = re.compile(r"<\s*([A-ZÀ-ÖØ-Ý][A-ZÀ-ÖØ-Ý0-9 '’/_\-]{1,68}?)\s*>")
 
 
 def _champ(lignes, cle):
@@ -470,56 +477,53 @@ def _champ(lignes, cle):
             continue
         morceaux = [m.group(1).strip()]
         for suite in lignes[k + 1:]:
-            if not suite.strip() or any(p.match(suite) for p in _ETIQUETTES.values()):
+            if (not suite.strip() or any(p.match(suite) for p in _ETIQUETTES.values())
+                    or re.match(r"^\s*(#{1,6}\s|(-{3,}|\*{3,}|_{3,})\s*$|```)", suite)):
                 break
             morceaux.append(suite.strip())
         return " ".join(x for x in morceaux if x).strip().strip("*").strip()
     return ""
 
 
+def _normaliser_variables(code):
+    """Les modèles écrivent parfois {{VARIABLE}}, {VARIABLE} ou <VARIABLE> : tout devient [VARIABLE]."""
+    code = _RE_ACCOLADES2.sub(lambda m: "[" + m.group(1).strip() + "]", code)
+    code = _RE_ACCOLADES1.sub(lambda m: "[" + m.group(1).strip() + "]", code)
+    return _RE_ANGLES.sub(lambda m: "[" + m.group(1).strip() + "]", code)
+
+
+def _mesurer_prompt(code):
+    """(nombre de mots, nombre de variables [..], nombre d'étiquettes RÔLE/CONTEXTE/TÂCHE...)"""
+    sans_accent = _sans_accents(code).upper()
+    champs = sum(1 for c in _CHAMPS_PROMPT if re.search(rf"\b{c}\b\s*\**\s*:", sans_accent))
+    return len(code.split()), len(_RE_VARIABLE.findall(code)), champs
+
+
 def _titre_propre(brut, maxi=90):
     t = re.sub(r"^#+\s*", "", brut).strip().strip("*").strip()
     t = re.sub(r"^\d{1,2}\s*[.)\-:]\s*", "", t)
     t = t.strip(" .:;*")
-    if not (3 <= len(t) <= maxi):
-        raise ErreurModele("titre de prompt ou de catégorie invalide")
+    if len(t) < 3:
+        raise ErreurModele("titre de prompt vide (une ligne « ### Titre » est attendue)")
+    if len(t) > maxi:
+        t = t[:maxi].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
     return t
 
 
 def _nom_categorie(ligne):
     t = re.sub(r"^#+\s*", "", ligne).strip().strip("*").strip()
     t = re.sub(r"^(partie|cat[ée]gorie)\s*\d+\s*[:.\-\u2013\u2014]\s*", "", t, flags=re.I)
-    return _titre_propre(t, maxi=80)
+    t = t.strip(" .:;*")
+    return t if 3 <= len(t) <= 80 else None
 
 
-def _verifier_prompt(code):
-    mots = len(code.split())
-    if mots < 60:
-        raise ErreurModele("un prompt est trop court")
-    if mots > 300:
-        raise ErreurModele("un prompt est trop long")
-    if len(_RE_VARIABLE.findall(code)) < 2:
-        raise ErreurModele("un prompt n'a pas assez de variables [A REMPLACER]")
-    sans_accent = _sans_accents(code).upper()
-    presents = sum(1 for champ in _CHAMPS_PROMPT
-                   if re.search(rf"(?m)^\s*{champ}\b", sans_accent))
-    if presents < 3:
-        raise ErreurModele("un prompt ne suit pas le schéma RÔLE / CONTEXTE / TÂCHE...")
-    if _semble_anglais(code):
-        raise ErreurModele("un prompt est rédigé en anglais")
-
-
-def analyser_partie_pack(texte):
-    """Vérifie et met en forme une partie du pack. Renvoie (catégorie, [5 prompts]).
-    Lève ErreurModele si le format n'est pas respecté : rien n'est alors écrit dans Airtable."""
+def analyser_partie_pack(texte, categorie_defaut="Prompts"):
+    """Vérifie et met en forme une partie du pack.
+    Renvoie ((catégorie, [5 prompts]), avertissements) ou lève ErreurModele (structure inutilisable).
+    Les messages ne contiennent que des chiffres et des consignes : jamais de contenu (logs publics)."""
     lignes = nettoyer_markdown(texte).split("\n")
-    debut = next((k for k, l in enumerate(lignes) if re.match(r"^##\s+\S", l)), None)
-    if debut is None:
-        raise ErreurModele("titre de catégorie manquant")
-    categorie = _nom_categorie(lignes[debut])
-
-    blocs, courant, dans_code = [], None, False
-    for ligne in lignes[debut + 1:]:
+    blocs, avant, courant, dans_code = [], [], None, False
+    for ligne in lignes:
         if ligne.strip().startswith("```"):
             dans_code = not dans_code
         if not dans_code and re.match(r"^###\s+\S", ligne):
@@ -527,24 +531,52 @@ def analyser_partie_pack(texte):
             blocs.append(courant)
         elif courant is not None:
             courant["lignes"].append(ligne)
+        else:
+            avant.append(ligne)
     if len(blocs) < NB_PROMPTS_PAR_PARTIE:
-        raise ErreurModele(f"{len(blocs)} prompts au lieu de {NB_PROMPTS_PAR_PARTIE}")
+        raise ErreurModele(f"{len(blocs)} prompts trouvés au lieu de {NB_PROMPTS_PAR_PARTIE} "
+                           "(chaque prompt commence par une ligne « ### Titre »)")
 
-    prompts = []
-    for bloc in blocs[:NB_PROMPTS_PAR_PARTIE]:
+    avert = []
+    categorie = next((_nom_categorie(l) for l in avant if re.match(r"^#{1,2}\s+\S", l)), None)
+    if not categorie:
+        categorie = categorie_defaut
+        avert.append("titre de catégorie manquant (une ligne « ## Nom de la catégorie » est attendue)")
+
+    prompts, stats = [], []
+    for k, bloc in enumerate(blocs[:NB_PROMPTS_PAR_PARTIE], start=1):
         titre = _titre_propre(bloc["titre"])
-        fences = [k for k, l in enumerate(bloc["lignes"]) if l.strip().startswith("```")]
+        fences = [i for i, l in enumerate(bloc["lignes"]) if l.strip().startswith("```")]
         if len(fences) < 2:
-            raise ErreurModele("bloc de prompt introuvable (```)")
+            raise ErreurModele(f"le prompt n°{k} n'est pas placé dans un bloc de code (``` ... ```)")
         code = "\n".join(bloc["lignes"][fences[0] + 1:fences[1]]).strip("\n")
+        code = _normaliser_variables(code).replace("**", "")
+        mots, variables, champs = _mesurer_prompt(code)
+        if mots < 40:
+            raise ErreurModele(f"le prompt n°{k} est trop court ({mots} mots ; 90 à 170 attendus)")
+        if mots > 600:
+            raise ErreurModele(f"le prompt n°{k} est trop long ({mots} mots ; 90 à 170 attendus)")
+        if _semble_anglais(code):
+            raise ErreurModele(f"le prompt n°{k} est rédigé en anglais (le français est demandé)")
         hors_code = bloc["lignes"][:fences[0]] + bloc["lignes"][fences[1] + 1:]
-        _verifier_prompt(code)
         quand, resultat, astuce = (_champ(hors_code, c) for c in ("quand", "resultat", "astuce"))
-        if not (quand and resultat and astuce):
-            raise ErreurModele("étiquette manquante (Quand l'utiliser / Résultat attendu / Astuce)")
         prompts.append({"titre": titre, "quand": quand, "prompt": code,
                         "resultat": resultat, "astuce": astuce})
-    return categorie, prompts
+        stats.append((mots, variables, champs))
+
+    if any(v < 2 for _, v, _ in stats):
+        avert.append("nombre de variables [EN MAJUSCULES] par prompt : "
+                     + ",".join(str(v) for _, v, _ in stats) + " (au moins 2 par prompt sont attendues)")
+    sans_schema = sum(1 for _, _, c in stats if c < 3)
+    if sans_schema:
+        avert.append(f"{sans_schema} prompt(s) sans le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE")
+    manquantes = sum(1 for p in prompts for cle in ("quand", "resultat", "astuce") if not p[cle])
+    if manquantes:
+        avert.append(f"{manquantes} ligne(s) manquante(s) parmi « Quand l'utiliser », « Résultat attendu » et « Astuce »")
+    courts = sum(1 for m, _, _ in stats if m < 60)
+    if courts:
+        avert.append(f"{courts} prompt(s) de moins de 60 mots (90 à 170 attendus)")
+    return (categorie, prompts), avert
 
 
 def assembler_pack(parties):
@@ -555,31 +587,39 @@ def assembler_pack(parties):
         morceaux.append(f"## Partie {k} \u2014 {categorie}")
         for p in prompts:
             numero += 1
-            morceaux.append(
-                f"### {numero}. {p['titre']}\n\n"
-                f"**Quand l\u2019utiliser :** {p['quand']}\n\n"
-                f"```\n{p['prompt']}\n```\n\n"
-                f"**Résultat attendu :** {p['resultat']}\n\n"
-                f"**Astuce :** {p['astuce']}")
+            carte = [f"### {numero}. {p['titre']}"]
+            if p.get("quand"):
+                carte.append(f"**Quand l\u2019utiliser :** {p['quand']}")
+            carte.append(f"```\n{p['prompt']}\n```")
+            if p.get("resultat"):
+                carte.append(f"**Résultat attendu :** {p['resultat']}")
+            if p.get("astuce"):
+                carte.append(f"**Astuce :** {p['astuce']}")
+            morceaux.append("\n\n".join(carte))
     morceaux.append(MENTIONS_PACK)
     return "\n\n".join(morceaux)
 
 
 # --- CV et template Notion : contrôle d'un document en un seul bloc ---
 def analyser_document(type_produit, texte):
+    """Renvoie (document, avertissements) ou lève ErreurModele si le document est inutilisable."""
     exig = EXIGENCES_DOCUMENT[type_produit]
     t = nettoyer_markdown(texte)
     m = re.search(r"(?m)^##\s+\S", t)
     if not m:
-        raise ErreurModele("aucun titre de section (##)")
+        raise ErreurModele("aucun titre de section « ## » (le document doit être découpé en sections « ## »)")
     t = t[m.start():]
-    if len(re.findall(r"(?m)^##\s+\S", t)) < exig["sections"]:
-        raise ErreurModele("document incomplet : sections manquantes")
-    if len(t) < exig["caracteres"]:
-        raise ErreurModele("document trop court")
     if _semble_anglais(t):
-        raise ErreurModele("document rédigé en anglais")
-    return t
+        raise ErreurModele("document rédigé en anglais (le français est demandé)")
+    if len(t) < exig["minimum"]:
+        raise ErreurModele(f"document beaucoup trop court ({len(t)} caractères)")
+    avert = []
+    nb = len(re.findall(r"(?m)^##\s+\S", t))
+    if nb < exig["sections"]:
+        avert.append(f"{nb} sections « ## » au lieu de {exig['sections']} attendues")
+    if len(t) < exig["caracteres"]:
+        avert.append(f"document plus court que prévu ({len(t)} caractères, {exig['caracteres']} attendus)")
+    return t, avert
 
 
 def pour_airtable(markdown):
@@ -611,28 +651,46 @@ def pour_airtable(markdown):
 # GÉNÉRATION (modèle de secours automatique)
 # ======================================================================
 class _Moteur:
-    """Choisit le modèle Groq et passe au suivant dès qu'un modèle échoue
-    (quota, panne ou contenu qui ne respecte pas le format)."""
+    """Choisit le modèle Groq. Un contenu refusé ou imparfait est retenté avec des consignes précises ;
+    ensuite on garde la meilleure version, ou on passe au modèle suivant."""
 
     def __init__(self, modeles):
         self.modeles = modeles
         self.rang = 0
 
+    @staticmethod
+    def _consigne(raison):
+        return ("\n\nATTENTION : ta réponse précédente ne respectait pas le format demandé "
+                f"({raison}). Recommence en corrigeant ce point, sans rien changer aux autres consignes.")
+
     def generer(self, systeme, prompt, max_tokens, analyseur, etiquette):
         while self.rang < len(self.modeles):
             modele = self.modeles[self.rang]
+            meilleur, consigne = None, ""
             for essai in range(1, ESSAIS_PAR_MODELE + 1):
                 suffixe = f" (essai {essai})" if essai > 1 else ""
                 print(f"  {etiquette} - modèle : {modele}{suffixe}")
                 try:
-                    texte = appeler_groq(modele, systeme, prompt, max_tokens)
+                    texte = appeler_groq(modele, systeme, prompt + consigne, max_tokens)
                 except ErreurModele as e:
                     print(f"  -> {modele} n'a pas pu répondre : {e}")
                     break                    # quota ou panne : inutile de réessayer ce modèle
                 try:
-                    return analyseur(texte)
+                    valeur, avertissements = analyseur(texte)
                 except ErreurModele as e:
                     print(f"  -> réponse de {modele} refusée : {e}")
+                    consigne = self._consigne(str(e))
+                    continue
+                if not avertissements:
+                    return valeur
+                bilan = " ; ".join(avertissements)
+                print(f"  -> réponse utilisable mais imparfaite : {bilan}")
+                if meilleur is None or len(avertissements) < len(meilleur[1]):
+                    meilleur = (valeur, avertissements)
+                consigne = self._consigne(bilan)
+            if meilleur is not None:
+                print("  -> meilleure version retenue malgré ces réserves : à relire avec attention avant de valider.")
+                return meilleur[0]
             self.rang += 1
         raise ErreurGeneration(f"aucun modèle n'a pu produire ({etiquette})")
 
@@ -646,8 +704,10 @@ def generer_pack(titre, moteur):
             axe_nom=axe_nom, axe_desc=axe_desc,
             deja=" ; ".join(deja) if deja else "aucun")
         etiquette = f"Partie {numero}/{NB_PARTIES_PACK}"
+        defaut = axe_nom.split(":", 1)[-1].strip().capitalize()
         categorie, prompts = moteur.generer(
-            SYSTEME_PACK, prompt, MAX_TOKENS_PARTIE, analyser_partie_pack, etiquette)
+            SYSTEME_PACK, prompt, MAX_TOKENS_PARTIE,
+            lambda t, d=defaut: analyser_partie_pack(t, d), etiquette)
         parties.append((categorie, prompts))
         deja += [p["titre"] for p in prompts]
         print(f"  {etiquette} validée ({len(prompts)} prompts)")
