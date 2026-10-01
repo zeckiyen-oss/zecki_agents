@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v3.3)
+AGENT CREATEUR (v3.4)
 =====================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, fabrique un PDF propre, puis remet la tâche à
 jour avec le statut "à valider". Toi seul valides ou refuses ensuite.
+
+NOUVEAUTÉS v3.4
+- Marque : le nom affiché sur la couverture et en pied de page vaut "Zecki" par défaut.
+  Pour le changer : variable MARQUE, ou une autre marque sur la 1re ligne d'un fichier marque.txt.
+- La phrase « pose-moi jusqu'à 3 questions » n'est plus ajoutée en double.
+- Dans un prompt, l'IA est tutoyée et le lecteur parle à la 1re personne (je / mon / ma) :
+  « vous / votre / vos » déclenche un 2e essai avec consigne précise.
 
 NOUVEAUTÉS v3.0
 - Prompts réécrits : français, structure imposée, sans tableau ni emoji.
@@ -39,7 +46,7 @@ from urllib.parse import quote
 
 import requests
 
-VERSION = "3.3"
+VERSION = "3.4"
 _DEBUT = time.monotonic()
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
@@ -56,7 +63,24 @@ AIRTABLE_TOKEN = _env("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = _env("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE = _env("AIRTABLE_TABLE") or "Produits"
 CHAMP_PDF = _env("AIRTABLE_CHAMP_PDF") or "PDF"     # champ Airtable de type Attachment
-MARQUE = _env("MARQUE")                             # optionnel : nom affiché sur le PDF
+MARQUE_PAR_DEFAUT = "Zecki"
+
+
+def _lire_marque(dossier=None):
+    """Nom affiché sur la couverture et en pied de page : variable MARQUE, sinon 1re ligne de
+    marque.txt (à côté du script), sinon « Zecki ». Un fichier absent ou vide n'est jamais une erreur."""
+    nom = _env("MARQUE")
+    if not nom:
+        try:
+            base = dossier or os.path.dirname(os.path.abspath(__file__))
+            with open(os.path.join(base, "marque.txt"), encoding="utf-8-sig") as f:
+                nom = (f.readline() or "").strip()
+        except (OSError, UnicodeError):
+            nom = ""
+    return nom[:70].strip() or MARQUE_PAR_DEFAUT
+
+
+MARQUE = _lire_marque()                             # nom affiché sur le PDF (couverture et pied de page)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -119,14 +143,15 @@ RÈGLES ABSOLUES
 2. Aucune introduction, aucune conclusion, aucun commentaire sur ta réponse : uniquement le contenu demandé.
 3. Chaque prompt est écrit pour être collé tel quel dans ChatGPT, Claude, Gemini ou Le Chat. Il suit le schéma RÔLE / CONTEXTE / TÂCHE / CONTRAINTES / FORMAT DE SORTIE (ces mots exacts, en majuscules, suivis de « : »), tutoie l'IA (« Tu es... ») et commence la ligne TÂCHE par un verbe à l'impératif (« Rédige », « Crée », « Propose », jamais à l'infinitif). Il demande à l'IA de poser au plus 3 questions si une information essentielle manque.
 4. Les variables à remplacer s'écrivent en MAJUSCULES entre crochets, par exemple [NOM DU CLIENT]. Chaque prompt contient de 3 à 6 variables. N'utilise jamais les crochets pour autre chose.
-5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...) et n'attribue à un outil que des fonctions qu'il possède réellement (Calendly = prise de rendez-vous ; Notion et Trello = suivi de tâches ; Zoom = visioconférence) ; en cas de doute, reste générique (« votre agenda »).
+5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...) et n'attribue à un outil que des fonctions qu'il possède réellement (Calendly = prise de rendez-vous ; Notion et Trello = suivi de tâches ; Zoom = visioconférence) ; en cas de doute, reste générique (« mon agenda » dans un prompt, « votre agenda » dans les lignes adressées au lecteur).
 6. Sécurité : ne demande jamais de saisir un mot de passe, un code d'accès, un IBAN ou une donnée personnelle sensible dans un prompt. Pour partager des accès, recommande un gestionnaire de mots de passe.
 7. Si un prompt touche au juridique, à la fiscalité ou à la comptabilité, précise dans « Astuce » que le résultat doit être validé par un professionnel.
 8. Les 5 prompts d'une partie sont tous différents : varie les livrables (message, document, checklist, plan, script, analyse).
 9. Les lignes « Quand l'utiliser », « Résultat attendu » et « Astuce » s'adressent au lecteur : vouvoie-le (« Vérifiez... », « Ajoutez... »). Seuls les prompts tutoient l'IA.
 10. Le lecteur travaille seul(e) : n'écris ni « l'agence » ni « l'équipe » ; utilise [MON NOM] ou [MA MARQUE] quand il faut le désigner.
 11. Ne demande jamais à l'IA d'inventer un témoignage, un avis client, une statistique, une référence ou une citation : elle n'utilise que les informations fournies dans les variables. N'écris jamais de lien ni d'adresse fictifs : utilise une variable comme [LIEN DU FORMULAIRE].
-12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes). Quand le prompt fixe un maximum, « Résultat attendu » écrit « jusqu'à N » ou « N au maximum », jamais « N » seul."""
+12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes). Quand le prompt fixe un maximum, « Résultat attendu » écrit « jusqu'à N » ou « N au maximum », jamais « N » seul.
+13. Dans le texte d'un prompt (entre les deux lignes ```), l'IA est toujours « tu » et le lecteur qui utilise le prompt parle de lui à la première personne : « je », « mon », « ma », « mes » (exemple : « Mon métier : [MÉTIER] »). N'écris jamais « vous », « votre » ni « vos » dans un prompt, sauf dans une phrase d'exemple entre guillemets « » destinée à son client."""
 
 UTILISATEUR_PACK = """Thème du pack : « {titre} ».
 
@@ -521,6 +546,13 @@ _ETIQUETTES_PROMPT = {
 }
 _RE_LIGNE_ETIQUETTE = re.compile(r"^(\s*)([A-Za-zÀ-ÿ' ]{3,20}?)\s*:\s*(.*)$")
 CLAUSE_QUESTIONS = "Si une information essentielle manque, pose-moi jusqu\u2019à 3 questions avant de répondre."
+# Le modèle écrit souvent lui-même la clause, sous d'autres formes : « pose-moi / demande-moi ... »,
+# « Poser jusqu'à 3 questions ... », « 3 questions au maximum ». Dans ce cas on n'ajoute rien.
+_RE_CLAUSE_DEJA = re.compile(
+    r"\b(?:pose|demande)[- ]moi\b"
+    r"|(?:jusqu['\u2019]à|au plus|au maximum|maximum)\s+(?:3|trois)\s+questions"
+    r"|\b(?:3|trois)\s+questions\s+(?:au\s+)?(?:maximum|plus)\b",
+    re.I)
 
 
 def _corriger_etiquettes(code):
@@ -544,7 +576,7 @@ def _corriger_etiquettes(code):
 def _ajouter_clause_questions(code):
     """Garantit que chaque prompt demande à l'IA de poser des questions si une information manque
     (les modèles l'oublient souvent) : la phrase est ajoutée à la ligne CONTRAINTES."""
-    if re.search(r"\b(?:pose|demande)[- ]moi\b", code, re.I):      # « pose-moi ... », « demande-moi ... »
+    if _RE_CLAUSE_DEJA.search(code):
         return code
     lignes = code.split("\n")
     for k in range(len(lignes) - 1, -1, -1):
@@ -553,6 +585,15 @@ def _ajouter_clause_questions(code):
             lignes[k] = fin + ("" if fin.endswith((".", "!", "?", "\u00bb", ")")) else ".") + " " + CLAUSE_QUESTIONS
             return "\n".join(lignes)
     return code.rstrip() + "\n" + CLAUSE_QUESTIONS
+
+
+_RE_VOUS = re.compile(r"(?<![\w-])(?:vous|votre|vos)(?![\w-])", re.I)       # « rendez-vous » ne compte pas
+_RE_GUILLEMETS = re.compile(r"«[^»\n]*»")
+
+
+def _compter_vouvoiement(code):
+    """Nombre de « vous / votre / vos » dans un prompt, hors phrases d'exemple entre « ... »."""
+    return len(_RE_VOUS.findall(_RE_GUILLEMETS.sub("", code)))
 
 
 def _mesurer_prompt(code):
@@ -640,6 +681,10 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
     courts = sum(1 for m, _, _ in stats if m < 60)
     if courts:
         avert.append(f"{courts} prompt(s) de moins de 60 mots (120 à 180 attendus)")
+    vouvoient = sum(1 for p in prompts if _compter_vouvoiement(p["prompt"]))
+    if vouvoient:
+        avert.append(f"{vouvoient} prompt(s) emploient « vous / votre / vos » : dans un prompt, l'IA est tutoyée "
+                     "(« Tu es... ») et le lecteur parle de lui (« je », « mon », « ma »)")
     return (categorie, prompts), avert
 
 
