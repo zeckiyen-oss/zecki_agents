@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v3.5)
+AGENT CREATEUR (v3.6)
 =====================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, fabrique un PDF propre, puis remet la tâche à
 jour avec le statut "à valider". Toi seul valides ou refuses ensuite.
+
+NOUVEAUTÉS v3.6
+- Quota protégé : au plus 2 réessais « qualité » par exécution (au lieu d'un réessai pour chaque partie),
+  et le journal indique le nombre de requêtes envoyées à Groq.
+- Faits : un prompt qui demande un résumé, un rapport ou un tarif sans variable qui apporte les faits
+  déclenche un réessai ; l'IA reçoit en plus l'interdiction d'inventer (« écris [À COMPLÉTER] »).
+- Rappels de prudence ajoutés automatiquement à « Astuce » (contrat et paiement, prospection à froid).
+- Durée de lecture ou de parole incompatible avec le nombre de mots : réessai.
+- Thème respecté : les 3 parties restent dans le thème du pack (plus de dérive vers le suivi de livrables).
+- « Prêt à copier dans Google Sheets » devient « à copier puis à répartir en colonnes ».
 
 NOUVEAUTÉS v3.5
 - L'agent est positionné en consultant senior du métier de VA / OBM : le « je » des prompts est un(e)
@@ -56,8 +66,9 @@ from urllib.parse import quote
 
 import requests
 
-VERSION = "3.5"
+VERSION = "3.6"
 _DEBUT = time.monotonic()
+_COMPTEUR = {"groq": 0}      # nombre de requêtes envoyées à Groq (affiché dans le journal)
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
 
@@ -111,6 +122,7 @@ TAILLE_MAX_PDF_OCTETS = 4_500_000   # Airtable accepte 5 Mo par envoi
 
 NB_PARTIES_PACK = 3
 NB_PROMPTS_PAR_PARTIE = 5
+MAX_REESSAIS_QUALITE = 2      # au plus 2 réessais « qualité » par exécution : protège le quota Groq
 ESSAIS_PAR_MODELE = 2         # 2e essai (avec consignes précises) si le contenu est refusé ou imparfait
 
 
@@ -162,15 +174,17 @@ RÈGLES ABSOLUES
 11. Ne demande jamais à l'IA d'inventer un témoignage, un avis client, une statistique, une référence ou une citation : elle n'utilise que les informations fournies dans les variables. N'écris jamais de lien ni d'adresse fictifs : utilise une variable comme [LIEN DU FORMULAIRE].
 12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes). Quand le prompt fixe un maximum, « Résultat attendu » écrit « jusqu'à N » ou « N au maximum », jamais « N » seul.
 13. Dans le texte d'un prompt (entre les deux lignes ```), l'IA est toujours « tu » et le lecteur qui utilise le prompt parle de lui à la première personne : « je », « mon », « ma », « mes » (exemple : « Mon métier : [MÉTIER] »). N'écris jamais « vous », « votre » ni « vos » dans un prompt, sauf dans une phrase d'exemple entre guillemets « » destinée à son client.
-14. Le « je » de chaque prompt est un(e) VA ou OBM indépendant(e) qui vend ses SERVICES, seul(e), à des entrepreneurs, coachs, agences et petites entreprises. N'imagine chez lui ni équipe commerciale, ni service juridique, ni logiciel ou produit à présenter, ni CRM d'entreprise, ni guide gratuit déjà publié : si un prompt en a besoin, c'est le lecteur qui le décrit dans une variable. Ne suppose jamais le genre du lecteur ni celui de son client (écris « en charge de » et non « chargé de » ; « [PRÉNOM] travaille comme [POSTE] » et non « il travaille »).
-15. Chiffres : n'impose jamais de bénéfices « mesurables », « chiffrés » ou « quantifiables » : l'IA n'utilise que les chiffres fournis dans les variables. Si un prompt demande un bilan ou des résultats, ajoute une variable comme [RÉSULTATS OBTENUS], sinon l'IA les inventera.
+14. Le « je » de chaque prompt est un(e) VA ou OBM indépendant(e) qui vend ses SERVICES, seul(e), à des entrepreneurs, coachs, agences et petites entreprises. N'imagine chez lui ni équipe commerciale, ni service juridique, ni logiciel ou produit à présenter, ni CRM d'entreprise, ni guide gratuit déjà publié : si un prompt en a besoin, c'est le lecteur qui le décrit dans une variable. Ne suppose jamais le genre du lecteur ni celui de son client (écris « en charge de » et non « chargé de » ; « [PRÉNOM] travaille comme [POSTE] » et non « il travaille »). N'écris jamais en dur une information sur l'offre, le client ou le prospect du lecteur (audit gratuit, webinaire, intérêt déjà manifesté, indicateurs suivis) : tout ce qui dépend de sa situation est une variable.
+15. Chiffres : n'impose jamais de bénéfices « mesurables », « chiffrés » ou « quantifiables » : l'IA n'utilise que les chiffres fournis dans les variables. Si un prompt demande un compte-rendu, un résumé, un bilan, un rapport ou un tarif, son CONTEXTE contient obligatoirement une variable qui fournit les faits ([NOTES DE L'APPEL], [DONNÉES DU MOIS], [RÉSULTATS OBTENUS], [TARIF PROPOSÉ]), sinon l'IA les inventera.
 16. Mise en forme : n'écris aucun symbole mathématique (≤ ≥ ≈ ~ <=) : écris « au maximum », « environ ». Évite les tableaux Markdown quand le résultat est destiné à un tableur (Google Sheets, Excel, Airtable) : demande une liste, une ligne par entrée, champs séparés par des points-virgules. N'annonce jamais qu'un résultat « se colle directement » dans un outil : écris « à copier puis à ajuster dans... ».
-17. Réalisme : une durée, une longueur et un livrable doivent être compatibles (un appel de 30 minutes demande un plan minuté et non un script de 10 phrases ; 120 à 150 mots se disent en une minute environ ; 800 mots ne font pas une démonstration de 30 minutes). « Quand l'utiliser » correspond exactement à la tâche (un bilan de projet suit la fin du projet, pas la signature).
-18. Relis chaque prompt avant de répondre : phrases complètes et grammaticales, impératif correct (« inclus », jamais « inclue » ; « Je viens de me connecter », jamais « de connecter »), aucune variable sans verbe autour."""
+17. Réalisme : une durée, une longueur et un livrable doivent être compatibles (un appel de 30 minutes demande un plan minuté et non un script de 10 phrases ; 120 à 150 mots se disent en une minute environ ; 800 mots ne font pas une démonstration de 30 minutes). « Quand l'utiliser » correspond exactement à la tâche (un bilan de projet suit la fin du projet, pas la signature). Si tu imposes un nombre de questions, laisse assez de phrases pour les poser (4 questions ne tiennent pas dans 2 phrases). Un script de N minutes à lire à voix haute compte environ 130 mots par minute.
+18. Relis chaque prompt avant de répondre : phrases complètes et grammaticales, impératif correct (« inclus », jamais « inclue » ; « Je viens de me connecter », jamais « de connecter » ; « exclus », jamais « exclut »), aucune variable sans verbe autour."""
 
 UTILISATEUR_PACK = """Thème du pack : « {titre} ».
 
 Public : le « je » des prompts est un(e) VA ou OBM indépendant(e), seul(e), qui vend ses services à des entrepreneurs et à de petites structures (aucun logiciel à présenter, aucune équipe, aucun service juridique chez lui).
+
+Reste strictement dans le thème : chaque prompt de cette partie sert directement « {titre} » (ne dérive pas vers un sujet voisin comme la gestion de projet, le suivi de livrables ou le reporting).
 
 Tu rédiges la PARTIE {numero} sur {total} : « {axe_nom} » - {axe_desc}.
 
@@ -202,7 +216,7 @@ AXES_PACK = [
     ("Pendant : produire et communiquer",
      "rédiger, échanger et exécuter concrètement avec les clients ou prospects"),
     ("Après : suivre, relancer et fidéliser",
-     "suivre les résultats, relancer, conclure, faire le bilan et entretenir la relation"),
+     "relancer, conclure et prolonger la relation, uniquement ce qui prolonge directement le thème du pack"),
 ]
 
 SYSTEME_CV = """Tu es un expert en recrutement freelance et en rédaction de profils pour Assistants Virtuels (VA) et Online Business Managers (OBM) francophones. Tu écris un produit numérique payant : chaque section doit être concrète et directement réutilisable.
@@ -371,6 +385,7 @@ def appeler_groq(modele, systeme, prompt, max_tokens):
         if _temps_restant() < 25:
             raise ErreurFatale("délai global presque épuisé : arrêt propre, la tâche reste 'à faire'")
         try:
+            _COMPTEUR["groq"] += 1
             r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=90)
         except requests.exceptions.RequestException as e:
             raise ErreurModele(f"problème réseau ({type(e).__name__})")
@@ -736,6 +751,7 @@ def _corriger_francais(texte):
     t = re.sub(r"\b(inclue)\b", inclus, texte, flags=re.I)
     t = re.sub(r"\bviens de connecter\b", "viens de me connecter", t)
     t = re.sub(r"\br[ôo]le[- ]?play\b", "jeu de rôle", t, flags=re.I)
+    t = re.sub(r"(?<=, )exclut(?![\w-])", "exclus", t)
     return re.sub(r"(?<=, )chargé(?:\(e\))? de\b", "en charge de", t)
 
 
@@ -752,6 +768,109 @@ def _demande_benefices_mesurables(code):
         if not _RE_NEGATION_PROCHE.search(code[max(0, m.start() - 30):m.start()]):
             return True
     return False
+
+
+# --- v3.6 : faits fournis, mentions « à faire valider », durée contre mots, promesses de tableur ---
+_RE_BESOIN_FAITS = re.compile(r"résum|synth[ée]ti|compte[- ]rendu|\brapport|\bbilan\b|performances?\b", re.I)
+_RE_BESOIN_TARIF = re.compile(r"\btarifs?\b|\bprix\b|honoraires", re.I)
+_RE_VARIABLE_FAITS = re.compile(
+    r"NOTES?|DONN[ÉE]ES|R[ÉE]SULTATS?|CHIFFRES?|RETOURS?|INDICATEURS?|[ÉE]CHANGES?|D[ÉE]CISIONS?|"
+    r"R[ÉE]SUM[ÉE]|STATISTIQUES?|COMPTE", re.I)
+_RE_VARIABLE_TARIF = re.compile(r"TARIFS?|PRIX|HONORAIRES|MONTANT|DEVIS", re.I)
+CLAUSE_FAITS = ("N\u2019invente aucun fait ni chiffre : utilise uniquement les informations fournies "
+                "et écris [À COMPLÉTER] quand une donnée manque.")
+_RE_CLAUSE_FAITS_DEJA = re.compile(r"n['\u2019]invente|À COMPLÉTER|A COMPLETER", re.I)
+
+
+def _ligne_etiquette(code, etiquette):
+    m = re.search(rf"(?m)^\s*{etiquette}\s*:(.*)$", code)
+    return m.group(1) if m else ""
+
+
+def _besoins_faits(code):
+    """(résumé/rapport demandé, tarif demandé) d'après la ligne TÂCHE."""
+    tache = _ligne_etiquette(code, "TÂCHE")
+    return bool(_RE_BESOIN_FAITS.search(tache)), bool(_RE_BESOIN_TARIF.search(tache))
+
+
+def _faits_manquants(code):
+    """Vrai si le prompt demande un résumé, un rapport ou un tarif SANS variable qui apporte les faits :
+    l'IA les inventerait (ex. « résume les décisions de l'appel » sans [NOTES DE L'APPEL])."""
+    resume, tarif = _besoins_faits(code)
+    noms = " ".join(_RE_VARIABLE.findall(code))
+    return (resume and not _RE_VARIABLE_FAITS.search(noms)) or (tarif and not _RE_VARIABLE_TARIF.search(noms))
+
+
+def _ajouter_clause_faits(code):
+    """Filet de sécurité : quand le prompt demande un résumé, un rapport ou un tarif, on interdit à l'IA d'inventer."""
+    resume, tarif = _besoins_faits(code)
+    if not (resume or tarif) or _RE_CLAUSE_FAITS_DEJA.search(code):
+        return code
+    lignes = code.split("\n")
+    for k in range(len(lignes) - 1, -1, -1):
+        if re.match(r"^\s*CONTRAINTES\s*:", lignes[k]):
+            fin = lignes[k].rstrip()
+            lignes[k] = fin + ("" if fin.endswith((".", "!", "?", "\u00bb", ")")) else ".") + " " + CLAUSE_FAITS
+            return "\n".join(lignes)
+    return code.rstrip() + "\n" + CLAUSE_FAITS
+
+
+_RE_DUREE_LECTURE = re.compile(
+    r"(\d+)\s*(minutes?|min|secondes?)\s+de\s+lecture|à\s+lire\s+en\s+(\d+)\s*(minutes?|min|secondes?)", re.I)
+
+
+def _incoherence_duree(texte):
+    """Vrai si une durée « de lecture » ou « à lire en » est incompatible avec le nombre de mots annoncé
+    (environ 200 mots par minute en lecture silencieuse, 130 à voix haute)."""
+    m = _RE_DUREE_LECTURE.search(texte)
+    if not m:
+        return False
+    n = int(m.group(1) or m.group(3))
+    unite = (m.group(2) or m.group(4)).lower()
+    minutes = n if unite.startswith("min") else n / 60
+    attendu = minutes * (200 if m.group(1) else 130)
+    mots = [int(re.sub(r"\D", "", x)) for x in re.findall(r"(\d[\d\u00a0 ]*)\s*mots", texte) if re.sub(r"\D", "", x)]
+    if not mots:
+        return False
+    return max(mots) < 0.6 * attendu or max(mots) > 2 * attendu
+
+
+_RE_JURIDIQUE = re.compile(
+    r"\bcontrats?\b|conditions? (?:générales|de paiement)|modalités de paiement|mentions légales|\bCGV\b|\bRGPD\b|"
+    r"données personnelles", re.I)
+_RE_PROSPECTION_FROIDE = re.compile(
+    r"prise de contact|prospection par e-?mail|e-?mail de prospection|message de prospection|à froid", re.I)
+_RE_DEJA_PRO = re.compile(r"professionnel|juriste|avocat|expert[- ]comptable|valid(?:er|ez|ation)", re.I)
+_RE_DEJA_PROSPECTION = re.compile(
+    r"règles? de (?:la )?prospection|consentement|ne plus (?:être )?contact|se désinscrire|refuser", re.I)
+MENTION_JURIDIQUE = ("Faites valider les aspects juridiques et financiers (contrat, paiement, données personnelles) "
+                     "par un professionnel avant tout envoi.")
+MENTION_PROSPECTION = "Respectez les règles de prospection de votre pays (consentement, possibilité de refuser les relances)."
+
+
+def _ajouter_mentions(code, astuce):
+    """Ajoute à « Astuce » les rappels de prudence que le modèle oublie (contrat et paiement, prospection à froid)."""
+    suite = []
+    if _RE_JURIDIQUE.search(code) and not _RE_DEJA_PRO.search(astuce):
+        suite.append(MENTION_JURIDIQUE)
+    if _RE_PROSPECTION_FROIDE.search(_ligne_etiquette(code, "TÂCHE")) and not _RE_DEJA_PROSPECTION.search(astuce):
+        suite.append(MENTION_PROSPECTION)
+    if not suite:
+        return astuce
+    base = (astuce or "").strip()
+    if base and not base.endswith((".", "!", "?")):
+        base += "."
+    return (base + " " + " ".join(suite)).strip()
+
+
+_RE_PROMESSE_TABLEUR = re.compile(
+    r"pr[êe]te?s?\s+à\s+être\s+copi[ée]e?s?\s+dans\s+(?:Google\s+Sheets|Excel|Airtable)"
+    r"(?:\s+ou\s+(?:Google\s+Sheets|Excel|Airtable))?", re.I)
+
+
+def _corriger_promesses(texte):
+    """Un texte séparé par des points-virgules ne se range pas tout seul en colonnes dans un tableur."""
+    return _RE_PROMESSE_TABLEUR.sub("à copier puis à répartir en colonnes (séparateur : point-virgule)", texte)
 
 
 def _tableau_pour_tableur(code):
@@ -822,7 +941,7 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
             raise ErreurModele(f"le prompt n°{k} n'est pas placé dans un bloc de code (``` ... ```)")
         code = "\n".join(bloc["lignes"][fences[0] + 1:fences[1]]).strip("\n")
         code = _normaliser_variables(code).replace("**", "")
-        code = _ajouter_clause_questions(_corriger_etiquettes(code))
+        code = _ajouter_clause_questions(_ajouter_clause_faits(_corriger_etiquettes(code)))
         code = _corriger_taches(_corriger_francais(code))
         mots, variables, champs = _mesurer_prompt(code)
         if mots < 40:
@@ -832,7 +951,7 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
         if _semble_anglais(code):
             raise ErreurModele(f"le prompt n°{k} est rédigé en anglais (le français est demandé)")
         hors_code = bloc["lignes"][:fences[0]] + bloc["lignes"][fences[1] + 1:]
-        quand, resultat, astuce = (_majuscule(_corriger_francais(_vouvoyer(_champ(hors_code, c))))
+        quand, resultat, astuce = (_majuscule(_corriger_promesses(_corriger_francais(_vouvoyer(_champ(hors_code, c)))))
                                    for c in ("quand", "resultat", "astuce"))
         prompts.append({"titre": titre, "quand": quand, "prompt": code,
                         "resultat": resultat, "astuce": astuce})
@@ -866,6 +985,17 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
     if tableurs:
         avert.append(f"{tableurs} prompt(s) demandent un tableau Markdown destiné à un tableur (Google Sheets, Excel, "
                      "Airtable) : demander une liste, une ligne par entrée, champs séparés par des points-virgules")
+    sans_faits = sum(1 for p in prompts if _faits_manquants(p["prompt"]))
+    if sans_faits:
+        avert.append(f"{sans_faits} prompt(s) demandent un résumé, un compte-rendu, un rapport ou un tarif sans variable "
+                     "qui fournit les faits : l'IA les inventerait (ajouter une variable comme [NOTES DE L'APPEL], "
+                     "[DONNÉES DU MOIS] ou [TARIF PROPOSÉ])")
+    duree = sum(1 for p in prompts if _incoherence_duree(p["prompt"] + " " + p["resultat"]))
+    if duree:
+        avert.append(f"{duree} prompt(s) annoncent une durée de lecture ou de parole incompatible avec le nombre de mots "
+                     "(environ 130 mots par minute à voix haute, 200 en lecture silencieuse)")
+    for p in prompts:
+        p["astuce"] = _ajouter_mentions(p["prompt"], p["astuce"])
     return (categorie, prompts), avert
 
 
@@ -947,6 +1077,7 @@ class _Moteur:
     def __init__(self, modeles):
         self.modeles = modeles
         self.rang = 0
+        self.reessais_qualite = 0
 
     @staticmethod
     def _consigne(raison):
@@ -977,6 +1108,11 @@ class _Moteur:
                 print(f"  -> réponse utilisable mais imparfaite : {bilan}")
                 if meilleur is None or len(avertissements) < len(meilleur[1]):
                     meilleur = (valeur, avertissements)
+                if essai < ESSAIS_PAR_MODELE:
+                    if self.reessais_qualite >= MAX_REESSAIS_QUALITE:
+                        print("  -> budget de réessais atteint (protège le quota) : pas de nouvel essai.")
+                        break
+                    self.reessais_qualite += 1
                 consigne = self._consigne(bilan)
             if meilleur is not None:
                 print("  -> meilleure version retenue malgré ces réserves : à relire avec attention avant de valider.")
@@ -1206,6 +1342,7 @@ def executer():
         print("Vérifie console.groq.com/docs/rate-limits (limites et modèles disponibles).")
         sys.exit(1)
 
+    print(f"Requêtes envoyées à Groq pour ce produit : {_COMPTEUR['groq']}")
     pdf = fabriquer_pdf(type_produit, titre, markdown, nb_prompts)
 
     try:
