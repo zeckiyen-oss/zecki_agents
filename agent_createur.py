@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-AGENT CREATEUR (v3.4)
+AGENT CREATEUR (v3.5)
 =====================
 Rôle : va chercher dans Airtable la prochaine tâche au statut "à faire",
 génère le contenu avec Groq, fabrique un PDF propre, puis remet la tâche à
 jour avec le statut "à valider". Toi seul valides ou refuses ensuite.
+
+NOUVEAUTÉS v3.5
+- L'agent est positionné en consultant senior du métier de VA / OBM : le « je » des prompts est un(e)
+  freelance seul(e) qui vend ses services (plus de démo de logiciel, d'équipe ou de service juridique imaginaires).
+- Lignes « Quand l'utiliser / Résultat attendu / Astuce » : passage automatique au vouvoiement
+  (« Vérifie » devient « Vérifiez », « ton agenda » devient « votre agenda »).
+- Corrections automatiques : symboles « <= », « ~ » remplacés par des mots, « inclue » devient « inclus »,
+  « Élaborer » devient « Élabore » en tête de TÂCHE, « rôle-play » devient « jeu de rôle ».
+- Nouveaux avertissements : bénéfices « mesurables » demandés (l'IA inventerait des chiffres), tableau
+  Markdown destiné à un tableur, tutoiement restant.
 
 NOUVEAUTÉS v3.4
 - Marque : le nom affiché sur la couverture et en pied de page vaut "Zecki" par défaut.
@@ -46,7 +56,7 @@ from urllib.parse import quote
 
 import requests
 
-VERSION = "3.4"
+VERSION = "3.5"
 _DEBUT = time.monotonic()
 BUDGET_TOTAL_SECONDES = 270   # le workflow coupe à 5 min : on s'arrête proprement avant
 
@@ -136,7 +146,7 @@ BANNIERE_NOTION = ("> **Document de travail :** plan de construction du template
 # ======================================================================
 # PROMPTS DE GÉNÉRATION
 # ======================================================================
-SYSTEME_PACK = """Tu es rédacteur senior et expert en prompt engineering. Tu crées des packs de prompts vendus comme produit numérique à des Assistants Virtuels (VA) et Online Business Managers (OBM) freelances francophones. Le lecteur a payé : chaque prompt doit être précis, immédiatement utilisable et nettement meilleur que ce qu'il écrirait lui-même en 30 secondes.
+SYSTEME_PACK = """Tu es consultant senior en organisation freelance et expert en prompt engineering. Tu connais de l'intérieur le quotidien d'un Assistant Virtuel (VA) ou d'un Online Business Manager (OBM) indépendant : trouver des clients, cadrer une mission, facturer, fidéliser. Tu rédiges des packs de prompts vendus comme produit numérique à ces freelances francophones. Le lecteur a payé : chaque prompt doit être précis, immédiatement utilisable et nettement meilleur que ce qu'il écrirait lui-même en 30 secondes. Tu signes ton travail comme un professionnel : rigoureux, concret, sans remplissage, et tu te relis avant de répondre.
 
 RÈGLES ABSOLUES
 1. Français professionnel et sans faute. Aucun emoji (même pour conseiller d'en utiliser), aucun tableau dans ta réponse, aucun HTML.
@@ -145,15 +155,22 @@ RÈGLES ABSOLUES
 4. Les variables à remplacer s'écrivent en MAJUSCULES entre crochets, par exemple [NOM DU CLIENT]. Chaque prompt contient de 3 à 6 variables. N'utilise jamais les crochets pour autre chose.
 5. Aucun nom de personne, d'entreprise ou de marque réels dans les exemples, aucun chiffre ni résultat promis. Cite uniquement des outils réels et actuels (Notion, Trello, Google Workspace, Zoom, Canva, Calendly...) et n'attribue à un outil que des fonctions qu'il possède réellement (Calendly = prise de rendez-vous ; Notion et Trello = suivi de tâches ; Zoom = visioconférence) ; en cas de doute, reste générique (« mon agenda » dans un prompt, « votre agenda » dans les lignes adressées au lecteur).
 6. Sécurité : ne demande jamais de saisir un mot de passe, un code d'accès, un IBAN ou une donnée personnelle sensible dans un prompt. Pour partager des accès, recommande un gestionnaire de mots de passe.
-7. Si un prompt touche au juridique, à la fiscalité ou à la comptabilité, précise dans « Astuce » que le résultat doit être validé par un professionnel.
+7. Si un prompt touche au juridique (contrat, conditions de paiement, mentions légales), à la fiscalité, à la comptabilité ou aux données personnelles (RGPD, suivi des emails), précise dans « Astuce » que le résultat doit être validé par un professionnel.
 8. Les 5 prompts d'une partie sont tous différents : varie les livrables (message, document, checklist, plan, script, analyse).
-9. Les lignes « Quand l'utiliser », « Résultat attendu » et « Astuce » s'adressent au lecteur : vouvoie-le (« Vérifiez... », « Ajoutez... »). Seuls les prompts tutoient l'IA.
+9. Les lignes « Quand l'utiliser », « Résultat attendu » et « Astuce » s'adressent au lecteur : vouvoie-le (« Vérifiez... », « Ajoutez... »). Aucun « tu », « ton », « ta », « tes » ni verbe à la 2e personne du singulier dans ces trois lignes, y compris dans les parties 2 et 3 (écris « Mentionnez », « Planifiez », « Relisez », jamais « Mentionne », « Planifie », « Relis »). Seuls les prompts tutoient l'IA.
 10. Le lecteur travaille seul(e) : n'écris ni « l'agence » ni « l'équipe » ; utilise [MON NOM] ou [MA MARQUE] quand il faut le désigner.
 11. Ne demande jamais à l'IA d'inventer un témoignage, un avis client, une statistique, une référence ou une citation : elle n'utilise que les informations fournies dans les variables. N'écris jamais de lien ni d'adresse fictifs : utilise une variable comme [LIEN DU FORMULAIRE].
 12. Cohérence : les nombres annoncés dans « Résultat attendu » (mots, lignes, colonnes, étapes, minutes) doivent correspondre exactement aux consignes du prompt, et les durées doivent être réalistes (un appel de lancement dure 30 à 60 minutes). Quand le prompt fixe un maximum, « Résultat attendu » écrit « jusqu'à N » ou « N au maximum », jamais « N » seul.
-13. Dans le texte d'un prompt (entre les deux lignes ```), l'IA est toujours « tu » et le lecteur qui utilise le prompt parle de lui à la première personne : « je », « mon », « ma », « mes » (exemple : « Mon métier : [MÉTIER] »). N'écris jamais « vous », « votre » ni « vos » dans un prompt, sauf dans une phrase d'exemple entre guillemets « » destinée à son client."""
+13. Dans le texte d'un prompt (entre les deux lignes ```), l'IA est toujours « tu » et le lecteur qui utilise le prompt parle de lui à la première personne : « je », « mon », « ma », « mes » (exemple : « Mon métier : [MÉTIER] »). N'écris jamais « vous », « votre » ni « vos » dans un prompt, sauf dans une phrase d'exemple entre guillemets « » destinée à son client.
+14. Le « je » de chaque prompt est un(e) VA ou OBM indépendant(e) qui vend ses SERVICES, seul(e), à des entrepreneurs, coachs, agences et petites entreprises. N'imagine chez lui ni équipe commerciale, ni service juridique, ni logiciel ou produit à présenter, ni CRM d'entreprise, ni guide gratuit déjà publié : si un prompt en a besoin, c'est le lecteur qui le décrit dans une variable. Ne suppose jamais le genre du lecteur ni celui de son client (écris « en charge de » et non « chargé de » ; « [PRÉNOM] travaille comme [POSTE] » et non « il travaille »).
+15. Chiffres : n'impose jamais de bénéfices « mesurables », « chiffrés » ou « quantifiables » : l'IA n'utilise que les chiffres fournis dans les variables. Si un prompt demande un bilan ou des résultats, ajoute une variable comme [RÉSULTATS OBTENUS], sinon l'IA les inventera.
+16. Mise en forme : n'écris aucun symbole mathématique (≤ ≥ ≈ ~ <=) : écris « au maximum », « environ ». Évite les tableaux Markdown quand le résultat est destiné à un tableur (Google Sheets, Excel, Airtable) : demande une liste, une ligne par entrée, champs séparés par des points-virgules. N'annonce jamais qu'un résultat « se colle directement » dans un outil : écris « à copier puis à ajuster dans... ».
+17. Réalisme : une durée, une longueur et un livrable doivent être compatibles (un appel de 30 minutes demande un plan minuté et non un script de 10 phrases ; 120 à 150 mots se disent en une minute environ ; 800 mots ne font pas une démonstration de 30 minutes). « Quand l'utiliser » correspond exactement à la tâche (un bilan de projet suit la fin du projet, pas la signature).
+18. Relis chaque prompt avant de répondre : phrases complètes et grammaticales, impératif correct (« inclus », jamais « inclue » ; « Je viens de me connecter », jamais « de connecter »), aucune variable sans verbe autour."""
 
 UTILISATEUR_PACK = """Thème du pack : « {titre} ».
+
+Public : le « je » des prompts est un(e) VA ou OBM indépendant(e), seul(e), qui vend ses services à des entrepreneurs et à de petites structures (aucun logiciel à présenter, aucune équipe, aucun service juridique chez lui).
 
 Tu rédiges la PARTIE {numero} sur {total} : « {axe_nom} » - {axe_desc}.
 
@@ -177,7 +194,7 @@ FORMAT DE SORTIE : ...
 **Résultat attendu :** une à deux phrases qui décrivent ce que l'IA va produire (structure, longueur).
 **Astuce :** une phrase (variante utile ou erreur à éviter).
 
-Chaque prompt (le texte entre les deux lignes ```) fait entre 120 et 180 mots : le CONTEXTE demande au moins 3 informations au lecteur (sous forme de variables) et les CONTRAINTES donnent 3 à 5 précisions concrètes (longueur, ton, ce qu'il faut éviter, structure). Écris la catégorie puis les 5 prompts, rien d'autre."""
+Chaque prompt (le texte entre les deux lignes ```) fait entre 120 et 180 mots : le CONTEXTE demande au moins 3 informations au lecteur (sous forme de variables) et les CONTRAINTES donnent 3 à 5 précisions concrètes (longueur, ton, ce qu'il faut éviter, structure). Rappels : les prompts parlent à la première personne (je, mon, ma) et tutoient l'IA ; les lignes « Quand l'utiliser », « Résultat attendu » et « Astuce » vouvoient le lecteur (Vérifiez, Ajoutez, Planifiez). Les chiffres de « Résultat attendu » reprennent exactement ceux du prompt. Écris la catégorie puis les 5 prompts, rien d'autre."""
 
 AXES_PACK = [
     ("Avant : préparer et cadrer",
@@ -473,6 +490,21 @@ def _retirer_enveloppe_code(texte):
     return texte
 
 
+_UNITES = (r"mots|lignes|items|points|étapes|colonnes|phrases|caractères|minutes|secondes|jours|heures|"
+           r"paragraphes|pages|actions|questions|slides|éléments|messages|emails|mails|clients|prospects")
+_RE_SYMB_MAX = re.compile(rf"(?:\u2264|<=)[ \u00a0]*(\d+(?:[.,]\d+)?)[ \u00a0]*({_UNITES})\b")
+_RE_SYMB_MIN = re.compile(rf"(?:\u2265|>=)[ \u00a0]*(\d+(?:[.,]\d+)?)[ \u00a0]*({_UNITES})\b")
+_RE_SYMB_ENVIRON = re.compile(r"(?:\u2248|(?<!~)~(?!~))[ \u00a0]*(?=\d)")
+
+
+def _remplacer_symboles(texte):
+    """« <= 20 mots » devient « 20 mots au maximum », « ~350 mots » devient « environ 350 mots » :
+    un symbole mathématique dans un produit vendu fait amateur (et la police du PDF l'affichait tel quel)."""
+    t = _RE_SYMB_MAX.sub(r"\1 \2 au maximum", texte)
+    t = _RE_SYMB_MIN.sub(r"\1 \2 au minimum", t)
+    return _RE_SYMB_ENVIRON.sub("environ ", t)
+
+
 def nettoyer_markdown(texte):
     """Rend le texte propre et prévisible : sans emoji, sans tableau, sans \\n littéraux."""
     t = texte.replace("\r\n", "\n").replace("\r", "\n")
@@ -481,6 +513,7 @@ def nettoyer_markdown(texte):
     t = t.translate(_ZERO_LARGEUR)
     t = t.replace("\u2011", "-").replace("\u202f", "\u00a0")
     t = _retirer_emoji(t)
+    t = _remplacer_symboles(t)
     t = _RE_APOSTROPHE.sub("\u2019", t)          # apostrophe typographique : l'IA -> l’IA
     t = "\n".join(l.rstrip() for l in t.split("\n"))
     t = tableaux_vers_listes(t)
@@ -590,6 +623,140 @@ def _ajouter_clause_questions(code):
 _RE_VOUS = re.compile(r"(?<![\w-])(?:vous|votre|vos)(?![\w-])", re.I)       # « rendez-vous » ne compte pas
 _RE_GUILLEMETS = re.compile(r"«[^»\n]*»")
 
+# --- v3.5 : lignes adressées au lecteur (Quand l'utiliser / Résultat attendu / Astuce) toujours vouvoyées ---
+# Seuls des verbes sans ambiguïté sont convertis en tête de phrase (« relance » ou « date » peuvent être des noms).
+_TU_REGULIERS = (
+    "vérifie ajoute utilise mentionne prépare planifie enregistre teste personnalise adapte remplace évite "
+    "anticipe privilégie priorise reformule rédige crée ajuste modifie invite indique associe combine clarifie "
+    "confirme évalue compare regroupe trie remercie contacte télécharge importe exporte termine insiste pense "
+    "évoque explique joue simplifie supprime formate nomme numérote surligne soigne adopte rassure imprime "
+    "commence propose arrête respecte").split()
+_TU_IRREGULIERS = {
+    "insère": "insérez", "relis": "relisez", "écris": "écrivez", "lis": "lisez", "fais": "faites",
+    "prends": "prenez", "dis": "dites", "choisis": "choisissez", "définis": "définissez", "finis": "finissez",
+    "sois": "soyez", "aie": "ayez", "mets": "mettez", "prévois": "prévoyez", "revois": "revoyez",
+    "envoie": "envoyez", "essaie": "essayez", "appelle": "appelez", "rappelle": "rappelez",
+    "répète": "répétez", "intègre": "intégrez", "entraîne": "entraînez", "conclus": "concluez",
+    "établis": "établissez", "reçois": "recevez", "tiens": "tenez", "obtiens": "obtenez", "retiens": "retenez",
+}
+# Ces mots sont aussi des noms (« la relance ») : convertis seulement quand un pronom les suit (« relance-le »).
+_TU_AMBIGUS = ("partage demande copie sauvegarde archive note relance garde colle pose classe compte "
+               "limite liste marque date mesure cible").split()
+_TU_VOUS = {v: v + "z" for v in _TU_REGULIERS}
+_TU_VOUS.update(_TU_IRREGULIERS)
+_TU_CLITIQUE = dict(_TU_VOUS)
+_TU_CLITIQUE.update({v: v + "z" for v in _TU_AMBIGUS})
+
+
+def _alternance(mots):
+    return "|".join(sorted((re.escape(m) for m in mots), key=len, reverse=True))
+
+
+_RE_TU_DEBUT = re.compile(
+    rf"(^|[.!?;:]\s+|\bet\s+|\bpuis\s+|,\s+)({_alternance(_TU_VOUS)})(?![\w\u2019'-])", re.I)
+_RE_TU_CLITIQUE = re.compile(
+    rf"\b({_alternance(_TU_CLITIQUE)})-(la|le|les|lui|leur|moi|en|y|toi)\b", re.I)
+_RE_TON = re.compile(r"((?:\S+\s+)?)\b(ton)\b(?![\w\u2019'-])", re.I)
+_DETERMINANTS_TON = {"un", "le", "du", "ce", "au", "même", "mon", "son", "notre", "votre", "leur", "quel",
+                     "de", "d'", "d\u2019"}
+_RE_T_ELISION = re.compile(r"\b(pour|de)\s+(?:t['\u2019](?=\w)|te\s+(?=\w))", re.I)
+_RE_TU_RESTANT = re.compile(r"(?<![\w\u2019'-])tu(?![\w\u2019'-])", re.I)
+
+
+def _maj_comme(modele, mot):
+    return mot[:1].upper() + mot[1:] if modele[:1].isupper() else mot
+
+
+def _vouvoyer(texte):
+    """Passe au vouvoiement une ligne adressée au lecteur : « Vérifie ton agenda » devient « Vérifiez votre agenda ».
+    Les phrases citées entre « » (exemples) ne sont jamais modifiées."""
+    if not texte:
+        return texte
+    morceaux = re.split(r"(«[^»\n]*»)", texte)
+    if len(morceaux) > 1:
+        sortie = []
+        for k, morceau in enumerate(morceaux):
+            if k % 2 == 1:
+                sortie.append(morceau)                      # citation : intacte
+            else:
+                # \x00 empêche un début de morceau (juste après une citation) d'être pris pour un début de phrase
+                sortie.append(_vouvoyer(("\x00" if k else "") + morceau).replace("\x00", ""))
+        return "".join(sortie)
+
+    def clitique(m):
+        suite = "vous" if m.group(2).lower() == "toi" else m.group(2)
+        return _maj_comme(m.group(1), _TU_CLITIQUE[m.group(1).lower()]) + "-" + suite
+
+    def debut(m):
+        return m.group(1) + _maj_comme(m.group(2), _TU_VOUS[m.group(2).lower()])
+
+    def ton(m):
+        precedent = m.group(1).strip().lower()
+        if precedent in _DETERMINANTS_TON:      # « un ton chaleureux », « changer de ton » : le nom, pas le possessif
+            return m.group(0)
+        return m.group(1) + _maj_comme(m.group(2), "votre")
+
+    t = _RE_TU_CLITIQUE.sub(clitique, texte)
+    t = _RE_TU_DEBUT.sub(debut, t)
+    t = _RE_TON.sub(ton, t)
+    t = re.sub(r"(?<![\w\u2019'-])tes(?![\w\u2019'-])", "vos", t)
+    t = re.sub(r"(?<![\w\u2019'-])ta(?![\w\u2019'-])", "votre", t)
+    t = re.sub(r"(?<![\w\u2019'-])toi(?![\w\u2019'-])", "vous", t)
+    return _RE_T_ELISION.sub(lambda m: m.group(1) + " vous ", t)
+
+
+def _tutoiement_restant(texte):
+    return bool(_RE_TU_RESTANT.search(texte or ""))
+
+
+_INF_IMPERATIF = {
+    "élaborer": "élabore", "rédiger": "rédige", "créer": "crée", "proposer": "propose", "concevoir": "conçois",
+    "préparer": "prépare", "établir": "établis", "produire": "produis", "générer": "génère",
+    "construire": "construis", "définir": "définis", "écrire": "écris", "dresser": "dresse",
+    "formuler": "formule", "analyser": "analyse", "lister": "liste", "structurer": "structure",
+}
+_RE_TACHE = re.compile(r"(?m)^(\s*TÂCHE\s*:\s*)([A-Za-zÀ-ÿ]+)")
+
+
+def _corriger_taches(code):
+    """La ligne TÂCHE commence par un impératif (« Élabore »), jamais par un infinitif (« Élaborer »)."""
+    def remplace(m):
+        imperatif = _INF_IMPERATIF.get(m.group(2).lower())
+        return m.group(1) + (_maj_comme(m.group(2), imperatif) if imperatif else m.group(2))
+    return _RE_TACHE.sub(remplace, code)
+
+
+def _corriger_francais(texte):
+    """Fautes réelles déjà rencontrées, corrigées sans risque (chaque règle est volontairement étroite)."""
+    def inclus(m):
+        avant = texte[max(0, m.start() - 30):m.start()]
+        if re.search(r"\bqu(?:e|['\u2019])\s*(?:\w+\s+){0,3}$", avant, re.I):     # subjonctif : « pour qu'il inclue »
+            return m.group(1)
+        return _maj_comme(m.group(1), "inclus")
+    t = re.sub(r"\b(inclue)\b", inclus, texte, flags=re.I)
+    t = re.sub(r"\bviens de connecter\b", "viens de me connecter", t)
+    t = re.sub(r"\br[ôo]le[- ]?play\b", "jeu de rôle", t, flags=re.I)
+    return re.sub(r"(?<=, )chargé(?:\(e\))? de\b", "en charge de", t)
+
+
+_RE_BENEFICE_MESURABLE = re.compile(
+    r"\b(?:bénéfices?|résultats?|gains?|impacts?|retours?)\s+(?:mesurables?|quantifiables?|chiffré(?:e)?s?)\b", re.I)
+
+
+_RE_NEGATION_PROCHE = re.compile(r"\b(?:aucun|aucune|sans|pas de|jamais|ni|évite|évitez|n['\u2019]invente|n['\u2019]inclus)\b", re.I)
+
+
+def _demande_benefices_mesurables(code):
+    """Vrai si le prompt EXIGE des bénéfices « mesurables » ; faux s'il l'interdit (« aucun résultat chiffré inventé »)."""
+    for m in _RE_BENEFICE_MESURABLE.finditer(code):
+        if not _RE_NEGATION_PROCHE.search(code[max(0, m.start() - 30):m.start()]):
+            return True
+    return False
+
+
+def _tableau_pour_tableur(code):
+    return bool(re.search(r"markdown", code, re.I) and re.search(r"google sheets|excel|airtable", code, re.I))
+
 
 def _compter_vouvoiement(code):
     """Nombre de « vous / votre / vos » dans un prompt, hors phrases d'exemple entre « ... »."""
@@ -656,6 +823,7 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
         code = "\n".join(bloc["lignes"][fences[0] + 1:fences[1]]).strip("\n")
         code = _normaliser_variables(code).replace("**", "")
         code = _ajouter_clause_questions(_corriger_etiquettes(code))
+        code = _corriger_taches(_corriger_francais(code))
         mots, variables, champs = _mesurer_prompt(code)
         if mots < 40:
             raise ErreurModele(f"le prompt n°{k} est trop court ({mots} mots ; 120 à 180 attendus)")
@@ -664,7 +832,8 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
         if _semble_anglais(code):
             raise ErreurModele(f"le prompt n°{k} est rédigé en anglais (le français est demandé)")
         hors_code = bloc["lignes"][:fences[0]] + bloc["lignes"][fences[1] + 1:]
-        quand, resultat, astuce = (_majuscule(_champ(hors_code, c)) for c in ("quand", "resultat", "astuce"))
+        quand, resultat, astuce = (_majuscule(_corriger_francais(_vouvoyer(_champ(hors_code, c))))
+                                   for c in ("quand", "resultat", "astuce"))
         prompts.append({"titre": titre, "quand": quand, "prompt": code,
                         "resultat": resultat, "astuce": astuce})
         stats.append((mots, variables, champs))
@@ -685,6 +854,18 @@ def analyser_partie_pack(texte, categorie_defaut="Prompts"):
     if vouvoient:
         avert.append(f"{vouvoient} prompt(s) emploient « vous / votre / vos » : dans un prompt, l'IA est tutoyée "
                      "(« Tu es... ») et le lecteur parle de lui (« je », « mon », « ma »)")
+    tutoient = sum(1 for p in prompts for c in ("quand", "resultat", "astuce") if _tutoiement_restant(p[c]))
+    if tutoient:
+        avert.append(f"{tutoient} ligne(s) « Quand l'utiliser / Résultat attendu / Astuce » tutoient le lecteur "
+                     "(vouvoiement attendu : « Vérifiez », « Ajoutez », « votre agenda »)")
+    mesurables = sum(1 for p in prompts if _demande_benefices_mesurables(p["prompt"]))
+    if mesurables:
+        avert.append(f"{mesurables} prompt(s) demandent des bénéfices « mesurables » ou « chiffrés » : l'IA inventerait "
+                     "des chiffres (elle ne doit utiliser que ceux fournis dans les variables)")
+    tableurs = sum(1 for p in prompts if _tableau_pour_tableur(p["prompt"]))
+    if tableurs:
+        avert.append(f"{tableurs} prompt(s) demandent un tableau Markdown destiné à un tableur (Google Sheets, Excel, "
+                     "Airtable) : demander une liste, une ligne par entrée, champs séparés par des points-virgules")
     return (categorie, prompts), avert
 
 
